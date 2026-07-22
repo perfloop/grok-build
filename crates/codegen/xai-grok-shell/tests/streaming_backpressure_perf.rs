@@ -21,7 +21,7 @@ use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::agent::mvp_agent::MvpAgent;
 use xai_grok_test_support::MockInferenceServer;
 
-const DEFAULT_STREAM_CHUNKS: usize = 4_096;
+const DEFAULT_STREAM_CHUNKS: usize = 1_024;
 const DEFAULT_CHUNK_PAYLOAD_BYTES: usize = 4 * 1024;
 const DEFAULT_CONSUMER_DELAY: Duration = Duration::from_millis(1);
 const DUPLEX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
