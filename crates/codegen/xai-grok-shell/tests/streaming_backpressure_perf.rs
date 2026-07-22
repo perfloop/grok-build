@@ -9,6 +9,7 @@
 //! Run:
 //!   cargo test --release -p xai-grok-shell --test streaming_backpressure_perf -- --exact stalled_acp_streaming_reports_backlog_and_preserves_output --nocapture
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::{self as acp, Agent as _};
@@ -20,8 +21,9 @@ use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::agent::mvp_agent::MvpAgent;
 use xai_grok_test_support::MockInferenceServer;
 
-const STREAM_CHUNKS: usize = 1_024;
-const ACP_STALL: Duration = Duration::from_millis(150);
+const STREAM_CHUNKS: usize = 4_096;
+const CHUNK_PAYLOAD_BYTES: usize = 4 * 1024;
+const ACP_STALL: Duration = Duration::from_millis(750);
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(20);
 const DUPLEX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
@@ -57,10 +59,37 @@ impl acp::Client for NoopClient {
 }
 
 fn streamed_text() -> String {
-    (0..STREAM_CHUNKS)
-        .map(|index| format!("chunk-{index:04}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let payload = "x".repeat(CHUNK_PAYLOAD_BYTES);
+    let mut text = String::with_capacity(STREAM_CHUNKS * (CHUNK_PAYLOAD_BYTES + 16));
+    for index in 0..STREAM_CHUNKS {
+        if index != 0 {
+            text.push(' ');
+        }
+        write!(text, "chunk-{index:04}-").expect("write into String");
+        text.push_str(&payload);
+    }
+    text
+}
+
+/// Current resident memory is sampled only while the ACP receiver is stalled.
+/// Measuring after the drain would include the deliberate output-validation
+/// copy and hide the retained queued-event footprint this workload targets.
+#[cfg(target_os = "linux")]
+fn resident_bytes() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .expect("VmRSS in process status")
+        .parse::<u64>()
+        .expect("numeric VmRSS");
+    kib * 1024
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resident_bytes() -> u64 {
+    0
 }
 
 fn take_agent_text(message: AcpClientMessage, output: &mut String, chunks: &mut usize) {
@@ -214,6 +243,7 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
         )));
         let mut prompt_result = None;
         let mut peak_backlog = 0usize;
+        let mut peak_stalled_rss_bytes = resident_bytes();
         let stall_deadline = tokio::time::Instant::now() + ACP_STALL;
 
         // Poll the prompt while leaving the actual outbound gateway receiver
@@ -227,6 +257,7 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
                 _ = tokio::time::sleep(Duration::from_millis(1)) => {}
             }
             peak_backlog = peak_backlog.max(gateway_rx.len());
+            peak_stalled_rss_bytes = peak_stalled_rss_bytes.max(resident_bytes());
         }
 
         let mut delivered = String::new();
@@ -269,6 +300,13 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
             "fixture must deliver streaming chunks"
         );
 
+        println!(
+            "{}",
+            json!({
+                "metric": "peak_stalled_process_rss_bytes",
+                "value": peak_stalled_rss_bytes,
+            })
+        );
         println!(
             "{}",
             json!({
