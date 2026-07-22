@@ -1,9 +1,11 @@
 //! End-to-end proof surface for Responses continuation requests.
 //!
-//! The workload is deliberately a long local-history session: one 96 KiB user
-//! prompt followed by two short ACP prompts. The final request must either
-//! retain the seed in a full snapshot or carry an explicit server cursor; this
-//! lets the test remain valid before and after a continuation implementation.
+//! The workload is deliberately a long local-history session: sixteen 16 KiB
+//! user prompts followed by a short ACP prompt. Each seed stays below the
+//! shell's individual-prompt offload threshold, so the final request must
+//! either retain the accumulated local history in a full snapshot or carry an
+//! explicit server cursor. This lets the test remain valid before and after a
+//! continuation implementation.
 //!
 //! The second test makes model changes a hard reset boundary: stale remote
 //! context must never cross a model switch.
@@ -21,7 +23,9 @@ use xai_grok_test_support::{GrokStdioClient, MockInferenceServer, MockModelEntry
 
 const MODEL_A: &str = "responses-continuation-a";
 const MODEL_B: &str = "responses-continuation-b";
-const INITIAL_PROMPT_BYTES: usize = 96 * 1024;
+const SEED_TURNS: usize = 16;
+const SEED_PROMPT_BYTES: usize = 16 * 1024;
+const SEED_MARKER: &str = "responses-continuation-seed-marker";
 const FINAL_PROMPT: &str = "Summarize the prior request in one sentence.";
 
 /// ACP's client-side connection owns `!Send` futures, so drive it on a local
@@ -34,12 +38,17 @@ where
     tokio::task::LocalSet::new().run_until(f()).await;
 }
 
-fn long_prompt() -> String {
-    let mut prompt = String::with_capacity(INITIAL_PROMPT_BYTES);
-    while prompt.len() < INITIAL_PROMPT_BYTES {
-        prompt.push_str("retain this long request context across later prompts; ");
+fn seed_marker(turn: usize) -> String {
+    format!("{SEED_MARKER}-{turn:02}")
+}
+
+fn seed_prompt(turn: usize) -> String {
+    let mut prompt = format!("{}\n", seed_marker(turn));
+    prompt.reserve(SEED_PROMPT_BYTES - prompt.len());
+    while prompt.len() < SEED_PROMPT_BYTES {
+        prompt.push_str("retain this seeded request context across later prompts; ");
     }
-    prompt.truncate(INITIAL_PROMPT_BYTES);
+    prompt.truncate(SEED_PROMPT_BYTES);
     prompt
 }
 
@@ -91,7 +100,10 @@ fn contains_text(items: &[Value], expected: &str) -> bool {
     items
         .iter()
         .filter_map(item_text)
-        .any(|text| text == expected)
+        // The shell can wrap ACP prompts in an on-disk prompt-file envelope.
+        // The original user text must therefore be present, but need not be
+        // the whole input-text block.
+        .any(|text| text.contains(expected))
 }
 
 fn latest_user_text(items: &[Value]) -> Option<&str> {
@@ -106,9 +118,8 @@ fn latest_user_text(items: &[Value]) -> Option<&str> {
 /// future continuation implementation. A delta without a predecessor id would
 /// silently discard user context; a cursor without storage would not be a
 /// durable remote checkpoint.
-fn assert_history_or_cursor(body: &Value, seed: &str) {
+fn assert_history_or_cursor(body: &Value) {
     let items = input_items(body);
-    let has_seed = contains_text(items, seed);
     match body.get("previous_response_id").and_then(Value::as_str) {
         Some(cursor) => {
             assert!(!cursor.is_empty(), "continuation cursor must be nonempty");
@@ -118,20 +129,24 @@ fn assert_history_or_cursor(body: &Value, seed: &str) {
                 "a continuation cursor needs a stored remote checkpoint"
             );
             assert!(
-                !has_seed,
+                !contains_text(items, SEED_MARKER),
                 "a cursor request should send only the newly appended delta, not the full seed"
             );
         }
-        None => assert!(
-            has_seed,
-            "without a continuation cursor, the request must retain the local history"
-        ),
+        None => {
+            for turn in 0..SEED_TURNS {
+                assert!(
+                    contains_text(items, &seed_marker(turn)),
+                    "without a continuation cursor, the request must retain every local seed"
+                );
+            }
+        }
     }
 }
 
-/// Measure the final Responses request after a 96 KiB seed and two ACP
-/// followups. The emitted byte count is the JSON body observed at the HTTP
-/// boundary; input-item count is a supporting structural signal.
+/// Measure the final Responses request after sixteen 16 KiB seed prompts.
+/// The emitted byte count is the JSON body observed at the HTTP boundary;
+/// input-item count is a supporting structural signal.
 #[tokio::test]
 #[ignore = "requires the composed xai-grok-pager binary"]
 async fn responses_continuation_long_history_final_turn() {
@@ -147,36 +162,49 @@ async fn responses_continuation_long_history_final_turn() {
             .create_session_with_model_timeout(workdir.path(), MODEL_A)
             .await;
 
-        let seed = long_prompt();
-        for prompt in [&seed, "Continue with the same task.", FINAL_PROMPT] {
+        for turn in 0..SEED_TURNS {
+            let prompt = seed_prompt(turn);
             let response = client
-                .prompt_with_timeout(&session_id, prompt)
+                .prompt_with_timeout(&session_id, &prompt)
                 .await
                 .unwrap_or_else(|error| {
                     panic!(
-                        "Responses prompt failed: {error:?}\nstderr:\n{}",
+                        "seed turn {turn} failed: {error:?}\nstderr:\n{}",
                         client.stderr()
                     )
                 });
             assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
         }
+        let response = client
+            .prompt_with_timeout(&session_id, FINAL_PROMPT)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "final Responses prompt failed: {error:?}\nstderr:\n{}",
+                    client.stderr()
+                )
+            });
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
 
         let turns = turn_bodies(&server);
         assert_eq!(
             turns.len(),
-            3,
+            SEED_TURNS + 1,
             "expected one Responses turn request per ACP prompt\nrequest log:\n{}",
             server.request_log_summary()
         );
         assert!(
-            contains_text(input_items(&turns[0]), &seed),
+            contains_text(input_items(&turns[0]), &seed_marker(0)),
             "the initial seed must reach the first Responses request"
         );
 
-        let final_body = turns.last().expect("three turn requests");
+        let final_body = turns.last().expect("seed and final turn requests");
         let final_items = input_items(final_body);
-        assert_eq!(latest_user_text(final_items), Some(FINAL_PROMPT));
-        assert_history_or_cursor(final_body, &seed);
+        assert!(
+            latest_user_text(final_items).is_some_and(|text| text.contains(FINAL_PROMPT)),
+            "the final request must contain the final ACP prompt"
+        );
+        assert_history_or_cursor(final_body);
         assert!(
             client
                 .captured_text()
@@ -223,7 +251,7 @@ async fn responses_continuation_model_switch_reseeds_history() {
             .create_session_with_model_timeout(workdir.path(), MODEL_A)
             .await;
 
-        let seed = long_prompt();
+        let seed = seed_prompt(0);
         client
             .prompt_with_timeout(&session_id, &seed)
             .await
@@ -263,7 +291,7 @@ async fn responses_continuation_model_switch_reseeds_history() {
             "model switch must invalidate any remote continuation cursor"
         );
         assert!(
-            contains_text(input_items(after_switch), &seed),
+            contains_text(input_items(after_switch), &seed_marker(0)),
             "model switch must reseed from authoritative local history"
         );
     })
