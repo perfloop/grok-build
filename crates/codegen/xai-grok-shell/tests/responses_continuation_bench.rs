@@ -157,15 +157,15 @@ async fn responses_continuation_long_history_final_turn() {
         .await;
         let workdir = git_workdir();
         let client = GrokStdioClient::spawn(&server, workdir.path()).await;
-        client.initialize_with_timeout().await;
+        client.initialize().await;
         let session_id = client
-            .create_session_with_model_timeout(workdir.path(), MODEL_A)
+            .create_session_with_model(workdir.path(), MODEL_A)
             .await;
 
         for turn in 0..SEED_TURNS {
             let prompt = seed_prompt(turn);
             let response = client
-                .prompt_with_timeout(&session_id, &prompt)
+                .prompt(&session_id, &prompt)
                 .await
                 .unwrap_or_else(|error| {
                     panic!(
@@ -176,7 +176,7 @@ async fn responses_continuation_long_history_final_turn() {
             assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
         }
         let response = client
-            .prompt_with_timeout(&session_id, FINAL_PROMPT)
+            .prompt(&session_id, FINAL_PROMPT)
             .await
             .unwrap_or_else(|error| {
                 panic!(
@@ -246,14 +246,14 @@ async fn responses_continuation_model_switch_reseeds_history() {
         .await;
         let workdir = git_workdir();
         let client = GrokStdioClient::spawn(&server, workdir.path()).await;
-        client.initialize_with_timeout().await;
+        client.initialize().await;
         let session_id = client
-            .create_session_with_model_timeout(workdir.path(), MODEL_A)
+            .create_session_with_model(workdir.path(), MODEL_A)
             .await;
 
         let seed = seed_prompt(0);
         client
-            .prompt_with_timeout(&session_id, &seed)
+            .prompt(&session_id, &seed)
             .await
             .unwrap_or_else(|error| {
                 panic!(
@@ -261,14 +261,14 @@ async fn responses_continuation_model_switch_reseeds_history() {
                     client.stderr()
                 )
             });
-        let switch = client.set_model_with_timeout(&session_id, MODEL_B).await;
+        let switch = client.set_model(&session_id, MODEL_B).await;
         assert!(
             switch.is_ok(),
             "same-harness Responses model switch should succeed: {switch:?}\nstderr:\n{}",
             client.stderr()
         );
         let response = client
-            .prompt_with_timeout(&session_id, FINAL_PROMPT)
+            .prompt(&session_id, FINAL_PROMPT)
             .await
             .unwrap_or_else(|error| {
                 panic!(
