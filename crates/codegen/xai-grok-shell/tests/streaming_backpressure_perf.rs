@@ -1,16 +1,17 @@
-//! End-to-end slow-ACP-consumer workload for the streaming backpressure path.
+//! End-to-end burst-stream workload for the streaming backpressure path.
 //!
-//! A loopback model emits a long Chat Completions response while the ACP
-//! consumer accepts one outbound message only after a fixed delay. The workload
-//! uses the real `MvpAgent -> SessionActor -> SamplerActor -> drive_l2` path,
-//! records per-text-message enqueue-to-delivery age from production metadata,
-//! and proves every streamed byte and terminal prompt response survive in order.
+//! A loopback model emits a long Chat Completions response as normal streaming
+//! chunks. The real `MvpAgent -> SessionActor -> SamplerActor -> drive_l2` path
+//! delivers those chunks to its outbound ACP gateway without injected consumer
+//! latency. The test records per-text-message enqueue-to-delivery age from
+//! production metadata and proves every streamed byte and terminal prompt
+//! response survive in order.
 //!
 //! Run:
-//!   cargo test --release -p xai-grok-shell --test streaming_backpressure_perf -- --exact stalled_acp_streaming_reports_backlog_and_preserves_output --nocapture
+//!   cargo test --release -p xai-grok-shell --test streaming_backpressure_perf -- --exact burst_acp_streaming_reports_backlog_and_preserves_output --nocapture
 
 use std::fmt::Write as _;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use agent_client_protocol::{self as acp, Agent as _};
 use serde_json::json;
@@ -23,13 +24,12 @@ use xai_grok_test_support::MockInferenceServer;
 
 const DEFAULT_STREAM_CHUNKS: usize = 1_024;
 const DEFAULT_CHUNK_PAYLOAD_BYTES: usize = 4 * 1024;
-const DEFAULT_CONSUMER_DELAY: Duration = Duration::from_millis(1);
 const DUPLEX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// The normal client-side RPC dispatcher is intentionally not installed for
 /// this workload. The agent still receives initialize/new-session/prompt
-/// requests over the duplex connection, while this test consumes its real
-/// outbound gateway at a deliberately slower fixed rate.
+/// requests over the duplex connection; the test directly receives each real
+/// outbound gateway message at the same boundary that the receiver drains.
 struct NoopClient;
 
 #[async_trait::async_trait(?Send)]
@@ -60,7 +60,6 @@ impl acp::Client for NoopClient {
 struct Workload {
     chunks: usize,
     chunk_payload_bytes: usize,
-    consumer_delay: Duration,
 }
 
 impl Workload {
@@ -79,10 +78,6 @@ impl Workload {
                 "GROK_PERF_CHUNK_PAYLOAD_BYTES",
                 DEFAULT_CHUNK_PAYLOAD_BYTES,
             ),
-            consumer_delay: Duration::from_millis(positive_usize(
-                "GROK_PERF_CONSUMER_DELAY_MS",
-                DEFAULT_CONSUMER_DELAY.as_millis() as usize,
-            ) as u64),
         }
     }
 }
@@ -215,7 +210,7 @@ async fn connect_and_auth(gateway: GatewaySender) -> acp::ClientSideConnection {
 }
 
 #[test]
-fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
+fn burst_acp_streaming_reports_backlog_and_preserves_output() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mock_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -275,10 +270,10 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
         let mut delivered_chunks = 0usize;
         let mut delivery_ages_ms = Vec::new();
 
-        // This is a sustained producer-over-consumer workload: each received
-        // gateway message costs one fixed consumer interval. The source model
-        // streams independently, so an uncapped in-process path accumulates
-        // both depth and enqueue-to-delivery age.
+        // The loopback model streams independently of the real sampler and
+        // session actors. Receiving directly from the outbound gateway adds no
+        // fixture-side service delay, so any depth or enqueue-to-delivery age
+        // comes from the in-process streaming path under this burst workload.
         while prompt_result.is_none() || delivered.len() < expected.len() {
             tokio::select! {
                 result = &mut prompt, if prompt_result.is_none() => {
@@ -293,7 +288,6 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
                         &mut delivery_ages_ms,
                     );
                     peak_backlog = peak_backlog.max(gateway_rx.len());
-                    tokio::time::sleep(workload.consumer_delay).await;
                 }
             }
         }
@@ -308,7 +302,7 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
         );
         assert_eq!(
             delivered, expected,
-            "a slow ACP consumer must still receive every streamed byte in order"
+            "the burst-stream path must still receive every streamed byte in order"
         );
         assert!(
             delivered_chunks > 0,
