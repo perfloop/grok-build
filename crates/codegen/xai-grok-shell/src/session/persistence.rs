@@ -2641,9 +2641,13 @@ fn classify_remote_delete(
 #[path = "persistence_tests.rs"]
 mod durable_update_tests;
 
+#[cfg(feature = "persistence-merge-bench")]
+#[path = "persistence_merge_fixture.rs"]
+pub mod persistence_merge_fixture;
+
 #[cfg(test)]
-#[path = "persistence_merge_bench.rs"]
-mod persistence_merge_bench;
+#[path = "persistence_merge_tests.rs"]
+mod persistence_merge_tests;
 
 #[cfg(test)]
 mod delete_session_history_tests {

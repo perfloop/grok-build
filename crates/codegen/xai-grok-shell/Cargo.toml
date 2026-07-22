@@ -8,6 +8,7 @@ edition.workspace = true
 default = []
 unstable = []
 dhat-heap = ["dep:dhat"]
+persistence-merge-bench = []
 default-bazel = []
 
 [dependencies]
@@ -210,6 +211,11 @@ workspace = true
 [[bench]]
 name = "session_list"
 harness = false
+
+[[bench]]
+name = "persistence_merge"
+harness = false
+required-features = ["dhat-heap", "persistence-merge-bench"]
 
 [lints]
 workspace = true
