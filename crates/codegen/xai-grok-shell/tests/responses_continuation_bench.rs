@@ -18,8 +18,11 @@
 use std::future::Future;
 
 use agent_client_protocol as acp;
-use serde_json::Value;
-use xai_grok_test_support::{GrokStdioClient, MockInferenceServer, MockModelEntry, git_workdir};
+use serde_json::{Value, json};
+use xai_grok_test_support::{
+    GrokStdioClient, InferenceEndpoint, InferenceExpectation, InferenceRequestMatcher,
+    MockInferenceServer, MockModelEntry, ScriptedResponse, SseEvent, git_workdir,
+};
 
 const MODEL_A: &str = "responses-continuation-a";
 const MODEL_B: &str = "responses-continuation-b";
@@ -57,11 +60,102 @@ fn responses_server(models: Vec<MockModelEntry>) -> impl Future<Output = MockInf
         let server = MockInferenceServer::start_with_models(models)
             .await
             .expect("start Responses mock server");
-        // Keep replies short so the workload cost is request history, not SSE
-        // output generation. The terminal response still carries a response id.
+        // Keep fallback replies short so the workload cost is request history,
+        // not SSE output generation. Foreground turn replies are registered
+        // below with unique terminal response IDs.
         server.set_response("continuation benchmark acknowledgement");
         server
     }
+}
+
+fn response_id(turn: usize) -> String {
+    format!("resp_continuation_{turn:02}")
+}
+
+/// Build a complete, typed Responses SSE stream with a caller-provided terminal
+/// response ID. The next cursor request must name this exact ID, proving the
+/// terminal stream value was propagated rather than fabricated locally.
+fn responses_script(response_id: &str, model: &str) -> ScriptedResponse {
+    const TEXT: &str = "continuation benchmark acknowledgement";
+    ScriptedResponse::sse(vec![
+        SseEvent::data(
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": 1234567890,
+                    "model": model,
+                    "status": "in_progress",
+                    "output": [],
+                },
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "item_id": format!("item_{response_id}"),
+                "output_index": 0,
+                "content_index": 0,
+                "delta": TEXT,
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            json!({
+                "type": "response.completed",
+                "sequence_number": 2,
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": 1234567890,
+                    "model": model,
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "id": format!("msg_{response_id}"),
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": TEXT,
+                            "annotations": [],
+                        }],
+                    }],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                        "input_tokens_details": { "cached_tokens": 0 },
+                        "output_tokens_details": { "reasoning_tokens": 0 },
+                    },
+                },
+            })
+            .to_string(),
+        ),
+        SseEvent::data("[DONE]"),
+    ])
+}
+
+fn expect_responses(
+    server: &MockInferenceServer,
+    model: &str,
+    response_ids: impl IntoIterator<Item = String>,
+) -> Vec<InferenceExpectation> {
+    response_ids
+        .into_iter()
+        .enumerate()
+        .map(|(turn, response_id)| {
+            server.expect_response(
+                format!("Responses continuation turn {turn}"),
+                InferenceRequestMatcher::foreground(InferenceEndpoint::Responses),
+                responses_script(&response_id, model),
+            )
+        })
+        .collect()
 }
 
 fn turn_bodies(server: &MockInferenceServer) -> Vec<Value> {
@@ -115,31 +209,72 @@ fn latest_user_text(items: &[Value]) -> Option<&str> {
 }
 
 /// Assert the protocol contract shared by the full-snapshot baseline and a
-/// future continuation implementation. A delta without a predecessor id would
-/// silently discard user context; a cursor without storage would not be a
-/// durable remote checkpoint.
-fn assert_history_or_cursor(body: &Value) {
-    let items = input_items(body);
-    match body.get("previous_response_id").and_then(Value::as_str) {
-        Some(cursor) => {
-            assert!(!cursor.is_empty(), "continuation cursor must be nonempty");
-            assert_eq!(
-                body.get("store"),
-                Some(&Value::Bool(true)),
-                "a continuation cursor needs a stored remote checkpoint"
-            );
+/// future continuation implementation. A warm request must name the exact
+/// unique ID emitted by the immediately preceding terminal SSE frame; a bogus
+/// locally fabricated cursor cannot satisfy this chain.
+fn assert_history_or_cursor_chain(turns: &[Value]) {
+    assert_eq!(
+        turns
+            .first()
+            .and_then(|body| body.get("previous_response_id")),
+        None,
+        "the first Responses request must seed from local history"
+    );
+
+    let uses_cursor = turns
+        .iter()
+        .skip(1)
+        .any(|body| body.get("previous_response_id").is_some());
+    if !uses_cursor {
+        assert!(
+            turns
+                .iter()
+                .all(|body| body.get("previous_response_id").is_none()),
+            "fallback requests must not mix local history with an unverified cursor"
+        );
+        let final_items = input_items(turns.last().expect("final request"));
+        for turn in 0..SEED_TURNS {
             assert!(
-                !contains_text(items, SEED_MARKER),
-                "a cursor request should send only the newly appended delta, not the full seed"
+                contains_text(final_items, &seed_marker(turn)),
+                "without a continuation cursor, the final request must retain every local seed"
             );
         }
-        None => {
-            for turn in 0..SEED_TURNS {
-                assert!(
-                    contains_text(items, &seed_marker(turn)),
-                    "without a continuation cursor, the request must retain every local seed"
-                );
-            }
+        return;
+    }
+
+    assert_eq!(
+        turns[0].get("store"),
+        Some(&Value::Bool(true)),
+        "the seed response must be stored before a later request can continue it"
+    );
+    for (turn, body) in turns.iter().enumerate().skip(1) {
+        let expected_cursor = response_id(turn - 1);
+        assert_eq!(
+            body.get("previous_response_id").and_then(Value::as_str),
+            Some(expected_cursor.as_str()),
+            "warm request {turn} must continue the immediately preceding terminal response"
+        );
+        assert_eq!(
+            body.get("store"),
+            Some(&Value::Bool(true)),
+            "every continuation response must remain stored for the next cursor"
+        );
+
+        let items = input_items(body);
+        if turn < SEED_TURNS {
+            assert!(
+                contains_text(items, &seed_marker(turn)),
+                "warm seed request {turn} must retain its newly appended ACP prompt"
+            );
+            assert!(
+                !contains_text(items, &seed_marker(turn - 1)),
+                "warm seed request {turn} must not resend its predecessor's history"
+            );
+        } else {
+            assert!(
+                !contains_text(items, SEED_MARKER),
+                "the final cursor request must not resend any seeded local history"
+            );
         }
     }
 }
@@ -155,6 +290,7 @@ async fn responses_continuation_long_history_final_turn() {
             MockModelEntry::new(MODEL_A).with_api_backend("responses"),
         ])
         .await;
+        let expectations = expect_responses(&server, MODEL_A, (0..=SEED_TURNS).map(response_id));
         let workdir = git_workdir();
         let client = GrokStdioClient::spawn(&server, workdir.path()).await;
         client.initialize().await;
@@ -204,7 +340,10 @@ async fn responses_continuation_long_history_final_turn() {
             latest_user_text(final_items).is_some_and(|text| text.contains(FINAL_PROMPT)),
             "the final request must contain the final ACP prompt"
         );
-        assert_history_or_cursor(final_body);
+        assert_history_or_cursor_chain(&turns);
+        for expectation in &expectations {
+            expectation.assert_satisfied();
+        }
         assert!(
             client
                 .captured_text()
@@ -244,6 +383,16 @@ async fn responses_continuation_model_switch_reseeds_history() {
             MockModelEntry::new(MODEL_B).with_api_backend("responses"),
         ])
         .await;
+        let before_switch = server.expect_response(
+            "Responses response before model switch",
+            InferenceRequestMatcher::foreground(InferenceEndpoint::Responses),
+            responses_script("resp_before_model_switch", MODEL_A),
+        );
+        let after_switch_response = server.expect_response(
+            "Responses response after model switch",
+            InferenceRequestMatcher::foreground(InferenceEndpoint::Responses),
+            responses_script("resp_after_model_switch", MODEL_B),
+        );
         let workdir = git_workdir();
         let client = GrokStdioClient::spawn(&server, workdir.path()).await;
         client.initialize().await;
@@ -294,6 +443,8 @@ async fn responses_continuation_model_switch_reseeds_history() {
             contains_text(input_items(after_switch), &seed_marker(0)),
             "model switch must reseed from authoritative local history"
         );
+        before_switch.assert_satisfied();
+        after_switch_response.assert_satisfied();
     })
     .await;
 }
