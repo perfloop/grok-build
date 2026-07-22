@@ -5,15 +5,16 @@
 //! validates the final concatenated text, matching the persistence actor's
 //! repeated merge path without storage or channel work.
 
+use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{Criterion, SamplingMode, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
 use xai_grok_shell::session::persistence::persistence_merge_fixture::MergeStreamFixture;
 
 #[global_allocator]
 static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
 
-fn allocation_metrics() -> (usize, usize) {
+fn allocation_metrics() -> (u64, u64) {
     // Construct the fixture before profiling so payload generation and actor
     // setup do not contribute to the allocation mechanism measurement.
     let mut fixture = MergeStreamFixture::new();
