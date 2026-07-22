@@ -1,10 +1,10 @@
-//! End-to-end stalled-ACP workload for the streaming backpressure path.
+//! End-to-end slow-ACP-consumer workload for the streaming backpressure path.
 //!
-//! A loopback model emits a long Chat Completions response while the agent's
-//! outbound ACP gateway is deliberately left undrained.  The workload uses the
-//! real `MvpAgent -> SessionActor -> SamplerActor -> drive_l2` path; after the
-//! fixed stall it drains the gateway and proves every streamed byte and the
-//! terminal prompt response survive in order.
+//! A loopback model emits a long Chat Completions response while the ACP
+//! consumer accepts one outbound message only after a fixed delay. The workload
+//! uses the real `MvpAgent -> SessionActor -> SamplerActor -> drive_l2` path,
+//! records per-text-message enqueue-to-delivery age from production metadata,
+//! and proves every streamed byte and terminal prompt response survive in order.
 //!
 //! Run:
 //!   cargo test --release -p xai-grok-shell --test streaming_backpressure_perf -- --exact stalled_acp_streaming_reports_backlog_and_preserves_output --nocapture
@@ -23,14 +23,13 @@ use xai_grok_test_support::MockInferenceServer;
 
 const DEFAULT_STREAM_CHUNKS: usize = 4_096;
 const DEFAULT_CHUNK_PAYLOAD_BYTES: usize = 4 * 1024;
-const DEFAULT_ACP_STALL: Duration = Duration::from_millis(750);
-const COMPLETE_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_CONSUMER_DELAY: Duration = Duration::from_millis(1);
 const DUPLEX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// The normal client-side RPC dispatcher is intentionally not installed for
-/// this workload.  The agent still receives initialize/new-session/prompt
-/// requests over the duplex connection, while its real outbound gateway queue
-/// remains stalled for `ACP_STALL`.
+/// this workload. The agent still receives initialize/new-session/prompt
+/// requests over the duplex connection, while this test consumes its real
+/// outbound gateway at a deliberately slower fixed rate.
 struct NoopClient;
 
 #[async_trait::async_trait(?Send)]
@@ -61,7 +60,7 @@ impl acp::Client for NoopClient {
 struct Workload {
     chunks: usize,
     chunk_payload_bytes: usize,
-    acp_stall: Duration,
+    consumer_delay: Duration,
 }
 
 impl Workload {
@@ -80,9 +79,9 @@ impl Workload {
                 "GROK_PERF_CHUNK_PAYLOAD_BYTES",
                 DEFAULT_CHUNK_PAYLOAD_BYTES,
             ),
-            acp_stall: Duration::from_millis(positive_usize(
-                "GROK_PERF_ACP_STALL_MS",
-                DEFAULT_ACP_STALL.as_millis() as usize,
+            consumer_delay: Duration::from_millis(positive_usize(
+                "GROK_PERF_CONSUMER_DELAY_MS",
+                DEFAULT_CONSUMER_DELAY.as_millis() as usize,
             ) as u64),
         }
     }
@@ -101,31 +100,24 @@ fn streamed_text(workload: &Workload) -> String {
     text
 }
 
-/// Current resident memory is sampled only while the ACP receiver is stalled.
-/// Measuring after the drain would include the deliberate output-validation
-/// copy and hide the retained queued-event footprint this workload targets.
-#[cfg(target_os = "linux")]
-fn resident_bytes() -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
-    let kib = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))
-        .and_then(|value| value.split_whitespace().next())
-        .expect("VmRSS in process status")
-        .parse::<u64>()
-        .expect("numeric VmRSS");
-    kib * 1024
-}
-
-#[cfg(not(target_os = "linux"))]
-fn resident_bytes() -> u64 {
-    0
-}
-
-fn take_agent_text(message: AcpClientMessage, output: &mut String, chunks: &mut usize) {
+/// Consume one outbound ACP message. `agentTimestampMs` is produced by
+/// `SessionActor::send_update` immediately before it queues the notification,
+/// so comparing it to the receive time measures real in-process delivery age.
+fn take_agent_text(
+    message: AcpClientMessage,
+    output: &mut String,
+    chunks: &mut usize,
+    delivery_ages_ms: &mut Vec<u64>,
+) {
     let AcpClientMessage::SessionNotification(args) = message else {
         return;
     };
+    let agent_timestamp_ms = args
+        .request
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("agentTimestampMs"))
+        .and_then(serde_json::Value::as_i64);
     let acp::SessionUpdate::AgentMessageChunk(chunk) = args.request.update else {
         return;
     };
@@ -133,9 +125,23 @@ fn take_agent_text(message: AcpClientMessage, output: &mut String, chunks: &mut 
         return;
     };
     if !text.text.is_empty() {
+        if let Some(timestamp) = agent_timestamp_ms {
+            let age = chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(timestamp)
+                .max(0) as u64;
+            delivery_ages_ms.push(age);
+        }
         *chunks += 1;
         output.push_str(&text.text);
     }
+}
+
+fn p99(mut values: Vec<u64>) -> u64 {
+    assert!(!values.is_empty(), "fixture must record text delivery ages");
+    values.sort_unstable();
+    let index = (values.len() * 99).div_ceil(100).saturating_sub(1);
+    values[index]
 }
 
 async fn connect_and_auth(gateway: GatewaySender) -> acp::ClientSideConnection {
@@ -168,9 +174,8 @@ async fn connect_and_auth(gateway: GatewaySender) -> acp::ClientSideConnection {
     );
     tokio::task::spawn_local(client_io);
 
-    let init = tokio::time::timeout(
-        COMPLETE_TIMEOUT,
-        client_conn.initialize(
+    let init = client_conn
+        .initialize(
             acp::InitializeRequest::new(acp::ProtocolVersion::V1)
                 .client_capabilities(
                     acp::ClientCapabilities::new()
@@ -190,26 +195,21 @@ async fn connect_and_auth(gateway: GatewaySender) -> acp::ClientSideConnection {
                     .as_object()
                     .cloned(),
                 ),
-        ),
-    )
-    .await
-    .expect("initialize timed out")
-    .expect("initialize failed");
+        )
+        .await
+        .expect("initialize failed");
     let method = init
         .auth_methods
         .iter()
         .find(|method| &*method.id().0 == "xai.api_key")
         .expect("xai.api_key auth method not advertised");
-    tokio::time::timeout(
-        COMPLETE_TIMEOUT,
-        client_conn.authenticate(
+    client_conn
+        .authenticate(
             acp::AuthenticateRequest::new(method.id().clone())
                 .meta(json!({ "headless": true }).as_object().cloned()),
-        ),
-    )
-    .await
-    .expect("authenticate timed out")
-    .expect("authenticate failed");
+        )
+        .await
+        .expect("authenticate failed");
 
     client_conn
 }
@@ -251,18 +251,15 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
     agent_runtime.block_on(local.run_until(async move {
         let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
         let client_conn = connect_and_auth(GatewaySender::new(gateway_tx)).await;
-        let session = tokio::time::timeout(
-            COMPLETE_TIMEOUT,
-            client_conn.new_session(
+        let session = client_conn
+            .new_session(
                 acp::NewSessionRequest::new(workdir.path().to_path_buf())
                     .meta(json!({ "modelId": "test-model" }).as_object().cloned()),
-            ),
-        )
-        .await
-        .expect("session/new timed out")
-        .expect("session/new failed");
+            )
+            .await
+            .expect("session/new failed");
 
-        // Exclude session-start notifications from the deliberate prompt stall.
+        // Exclude session-start notifications from the measured turn.
         while gateway_rx.try_recv().is_ok() {}
 
         let started = Instant::now();
@@ -274,26 +271,14 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
         )));
         let mut prompt_result = None;
         let mut peak_backlog = 0usize;
-        let mut peak_stalled_rss_bytes = resident_bytes();
-        let stall_deadline = tokio::time::Instant::now() + workload.acp_stall;
-
-        // Poll the prompt while leaving the actual outbound gateway receiver
-        // untouched. The queue length is therefore the real queued ACP work at
-        // the product delivery boundary, not a synthetic counter.
-        while tokio::time::Instant::now() < stall_deadline {
-            tokio::select! {
-                result = &mut prompt, if prompt_result.is_none() => {
-                    prompt_result = Some(result);
-                }
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
-            }
-            peak_backlog = peak_backlog.max(gateway_rx.len());
-            peak_stalled_rss_bytes = peak_stalled_rss_bytes.max(resident_bytes());
-        }
-
         let mut delivered = String::new();
         let mut delivered_chunks = 0usize;
-        let drain_deadline = tokio::time::Instant::now() + COMPLETE_TIMEOUT;
+        let mut delivery_ages_ms = Vec::new();
+
+        // This is a sustained producer-over-consumer workload: each received
+        // gateway message costs one fixed consumer interval. The source model
+        // streams independently, so an uncapped in-process path accumulates
+        // both depth and enqueue-to-delivery age.
         while prompt_result.is_none() || delivered.len() < expected.len() {
             tokio::select! {
                 result = &mut prompt, if prompt_result.is_none() => {
@@ -301,15 +286,14 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
                 }
                 message = gateway_rx.recv() => {
                     let message = message.expect("agent gateway must remain open during prompt");
-                    take_agent_text(message, &mut delivered, &mut delivered_chunks);
-                }
-                _ = tokio::time::sleep_until(drain_deadline) => {
-                    panic!(
-                        "stream did not drain within {:?}: delivered {} of {} bytes",
-                        COMPLETE_TIMEOUT,
-                        delivered.len(),
-                        expected.len(),
+                    take_agent_text(
+                        message,
+                        &mut delivered,
+                        &mut delivered_chunks,
+                        &mut delivery_ages_ms,
                     );
+                    peak_backlog = peak_backlog.max(gateway_rx.len());
+                    tokio::time::sleep(workload.consumer_delay).await;
                 }
             }
         }
@@ -324,18 +308,24 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
         );
         assert_eq!(
             delivered, expected,
-            "a stalled ACP receiver must still receive every streamed byte in order"
+            "a slow ACP consumer must still receive every streamed byte in order"
         );
         assert!(
             delivered_chunks > 0,
             "fixture must deliver streaming chunks"
         );
+        assert_eq!(
+            delivery_ages_ms.len(),
+            delivered_chunks,
+            "every text chunk must retain its production enqueue timestamp"
+        );
+        let p99_delivery_age_ms = p99(delivery_ages_ms);
 
         println!(
             "{}",
             json!({
-                "metric": "peak_stalled_process_rss_bytes",
-                "value": peak_stalled_rss_bytes,
+                "metric": "p99_acp_text_delivery_age_ms",
+                "value": p99_delivery_age_ms,
             })
         );
         println!(
