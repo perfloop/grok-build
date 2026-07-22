@@ -88,7 +88,7 @@ async fn connect_and_auth(gateway: GatewaySender) -> acp::ClientSideConnection {
     let (client_to_agent, agent_from_client) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
     let (agent_to_client, client_from_agent) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
     let agent_incoming = LineBufferedRead::spawn_local(agent_from_client.compat());
-    let (agent_conn, agent_io) = acp::AgentSideConnection::new(
+    let (_agent_conn, agent_io) = acp::AgentSideConnection::new(
         agent,
         agent_to_client.compat_write(),
         agent_incoming,
