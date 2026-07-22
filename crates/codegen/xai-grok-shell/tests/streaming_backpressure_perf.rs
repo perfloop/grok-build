@@ -21,9 +21,9 @@ use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::agent::mvp_agent::MvpAgent;
 use xai_grok_test_support::MockInferenceServer;
 
-const STREAM_CHUNKS: usize = 4_096;
-const CHUNK_PAYLOAD_BYTES: usize = 4 * 1024;
-const ACP_STALL: Duration = Duration::from_millis(750);
+const DEFAULT_STREAM_CHUNKS: usize = 4_096;
+const DEFAULT_CHUNK_PAYLOAD_BYTES: usize = 4 * 1024;
+const DEFAULT_ACP_STALL: Duration = Duration::from_millis(750);
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(20);
 const DUPLEX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
@@ -58,10 +58,40 @@ impl acp::Client for NoopClient {
     }
 }
 
-fn streamed_text() -> String {
-    let payload = "x".repeat(CHUNK_PAYLOAD_BYTES);
-    let mut text = String::with_capacity(STREAM_CHUNKS * (CHUNK_PAYLOAD_BYTES + 16));
-    for index in 0..STREAM_CHUNKS {
+struct Workload {
+    chunks: usize,
+    chunk_payload_bytes: usize,
+    acp_stall: Duration,
+}
+
+impl Workload {
+    fn from_env() -> Self {
+        fn positive_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value: &usize| *value > 0)
+                .unwrap_or(default)
+        }
+
+        Self {
+            chunks: positive_usize("GROK_PERF_STREAM_CHUNKS", DEFAULT_STREAM_CHUNKS),
+            chunk_payload_bytes: positive_usize(
+                "GROK_PERF_CHUNK_PAYLOAD_BYTES",
+                DEFAULT_CHUNK_PAYLOAD_BYTES,
+            ),
+            acp_stall: Duration::from_millis(positive_usize(
+                "GROK_PERF_ACP_STALL_MS",
+                DEFAULT_ACP_STALL.as_millis() as usize,
+            ) as u64),
+        }
+    }
+}
+
+fn streamed_text(workload: &Workload) -> String {
+    let payload = "x".repeat(workload.chunk_payload_bytes);
+    let mut text = String::with_capacity(workload.chunks * (workload.chunk_payload_bytes + 16));
+    for index in 0..workload.chunks {
         if index != 0 {
             text.push(' ');
         }
@@ -195,7 +225,8 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
     let server = mock_runtime
         .block_on(MockInferenceServer::start())
         .expect("mock inference server");
-    let expected = streamed_text();
+    let workload = Workload::from_env();
+    let expected = streamed_text(&workload);
     server.set_response(expected.clone());
 
     let grok_home = TempDir::new().expect("grok home");
@@ -244,7 +275,7 @@ fn stalled_acp_streaming_reports_backlog_and_preserves_output() {
         let mut prompt_result = None;
         let mut peak_backlog = 0usize;
         let mut peak_stalled_rss_bytes = resident_bytes();
-        let stall_deadline = tokio::time::Instant::now() + ACP_STALL;
+        let stall_deadline = tokio::time::Instant::now() + workload.acp_stall;
 
         // Poll the prompt while leaving the actual outbound gateway receiver
         // untouched. The queue length is therefore the real queued ACP work at
