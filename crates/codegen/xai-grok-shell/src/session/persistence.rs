@@ -2642,6 +2642,10 @@ fn classify_remote_delete(
 mod durable_update_tests;
 
 #[cfg(test)]
+#[path = "persistence_merge_bench.rs"]
+mod persistence_merge_bench;
+
+#[cfg(test)]
 mod delete_session_history_tests {
     use super::{DeleteSessionError, SessionDeletion, classify_remote_delete};
     use crate::remote::client::BackendError;
