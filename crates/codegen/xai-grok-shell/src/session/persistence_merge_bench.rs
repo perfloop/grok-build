@@ -3,15 +3,17 @@
 //! The allocation test deliberately runs inside the library test target so the
 //! existing `dhat-heap` test allocator can count only `maybe_merge_notification`.
 //! Run it explicitly with:
-//! `cargo test -p xai-grok-shell --features dhat-heap --lib \
+//! `cargo test -p xai-grok-shell --release --features dhat-heap --lib \
 //! persistence_merge_bench::merge_notification_stream_allocation_bytes \
 //! -- --ignored --nocapture --test-threads=1`
 
 use super::*;
 use std::sync::Arc;
+use std::time::Instant;
 
 const STREAM_CHUNKS: usize = 128;
 const CHUNK_BYTES: usize = 1024;
+const TIMED_STREAMS: usize = 16;
 
 fn test_persistence() -> SessionPersistence {
     let info = Info {
@@ -153,6 +155,26 @@ fn payload(index: usize) -> String {
     text
 }
 
+fn merge_stream(
+    persistence: &mut SessionPersistence,
+    inputs: &[acp::SessionNotification],
+    expected: &str,
+) {
+    persistence.pending_notification = None;
+    for incoming in inputs {
+        assert!(persistence.maybe_merge_notification(incoming).is_none());
+    }
+    assert_eq!(
+        text(
+            persistence
+                .pending_notification
+                .as_ref()
+                .expect("merge stream leaves one pending notification"),
+        ),
+        expected,
+    );
+}
+
 #[cfg(feature = "dhat-heap")]
 #[test]
 #[ignore = "allocation measurement; run explicitly with --features dhat-heap"]
@@ -161,23 +183,29 @@ fn merge_notification_stream_allocation_bytes() {
         .map(|index| message_notification("allocation-stream", payload(index)))
         .collect::<Vec<_>>();
     let expected = inputs.iter().map(text).collect::<String>();
-    let mut persistence = test_persistence();
+
+    let mut timed_persistence = test_persistence();
+    let started = Instant::now();
+    for _ in 0..TIMED_STREAMS {
+        merge_stream(&mut timed_persistence, &inputs, &expected);
+    }
+    let elapsed_ns_per_stream = started.elapsed().as_nanos() as f64 / TIMED_STREAMS as f64;
+
+    let mut allocation_persistence = test_persistence();
     let _profiler = dhat::Profiler::builder().testing().build();
     let before = dhat::HeapStats::get();
-
-    for incoming in &inputs {
-        assert!(persistence.maybe_merge_notification(incoming).is_none());
-    }
-
+    merge_stream(&mut allocation_persistence, &inputs, &expected);
     let after = dhat::HeapStats::get();
-    let merged = persistence
-        .pending_notification
-        .as_ref()
-        .expect("merge stream leaves one pending notification");
-    assert_eq!(text(merged), expected);
 
     let allocated_bytes = after.total_bytes - before.total_bytes;
     let allocation_blocks = after.total_blocks - before.total_blocks;
+    println!(
+        "PERFLOOP_JSONL {}",
+        serde_json::json!({
+            "metric": "elapsed_ns_per_stream",
+            "value": elapsed_ns_per_stream,
+        })
+    );
     println!(
         "PERFLOOP_JSONL {}",
         serde_json::json!({
