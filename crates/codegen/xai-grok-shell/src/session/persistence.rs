@@ -1496,34 +1496,24 @@ impl SessionPersistence {
             return None;
         };
 
-        let pending_update = pending.update.clone();
-        match (&incoming.update, pending_update) {
+        let mut pending = pending;
+        match (&incoming.update, &mut pending.update) {
             (
                 acp::SessionUpdate::AgentMessageChunk(new_chunk),
-                acp::SessionUpdate::AgentMessageChunk(mut pending_chunk),
+                acp::SessionUpdate::AgentMessageChunk(pending_chunk),
             )
             | (
                 acp::SessionUpdate::AgentThoughtChunk(new_chunk),
-                acp::SessionUpdate::AgentThoughtChunk(mut pending_chunk),
+                acp::SessionUpdate::AgentThoughtChunk(pending_chunk),
             ) => {
                 let did_merge = pending_chunk.meta.is_none()
                     && new_chunk.meta.is_none()
                     && Self::try_merge_text(&mut pending_chunk.content, &new_chunk.content);
 
                 if did_merge {
-                    let merged_update = match &incoming.update {
-                        acp::SessionUpdate::AgentMessageChunk(_) => {
-                            acp::SessionUpdate::AgentMessageChunk(pending_chunk)
-                        }
-                        acp::SessionUpdate::AgentThoughtChunk(_) => {
-                            acp::SessionUpdate::AgentThoughtChunk(pending_chunk)
-                        }
-                        _ => unreachable!(),
-                    };
-                    self.pending_notification = Some(
-                        acp::SessionNotification::new(incoming.session_id.clone(), merged_update)
-                            .meta(incoming.meta.clone()),
-                    );
+                    pending.session_id = incoming.session_id.clone();
+                    pending.meta = incoming.meta.clone();
+                    self.pending_notification = Some(pending);
                     None
                 } else {
                     self.pending_notification = Some(incoming.clone());
