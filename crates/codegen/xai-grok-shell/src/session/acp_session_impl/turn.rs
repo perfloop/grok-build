@@ -1945,7 +1945,7 @@ impl SessionActor {
                 )),
             );
             let model_timer = std::time::Instant::now();
-            let (response, latency) = match self.run_turn_via_sampler(request.clone()).await? {
+            let (response, latency) = match self.run_turn_via_sampler(request).await? {
                 SamplerTurnOutcome::Response(r, latency) => (r, latency),
                 SamplerTurnOutcome::CompactAndResubmit => {
                     auth_retry_schedule.reset();
