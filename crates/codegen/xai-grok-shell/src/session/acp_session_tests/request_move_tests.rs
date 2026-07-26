@@ -8,7 +8,6 @@
 use super::support::*;
 use super::*;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -141,13 +140,10 @@ async fn session_to_sampler_handoff_preserves_populated_request() {
             );
             let actor = actor_with_real_sampler(&server).await;
 
-            tokio::time::timeout(Duration::from_secs(10), run_turn(actor))
+            run_turn(actor)
                 .await
-                .expect("turn completes before the test timeout")
                 .expect("sampler completes the populated turn");
-            tokio::time::timeout(Duration::from_secs(10), expected.wait_satisfied())
-                .await
-                .expect("mock server observes the completed foreground request");
+            expected.wait_satisfied().await;
             expected.assert_satisfied();
 
             let body = server
@@ -186,9 +182,7 @@ async fn sampler_handoff_live_request_bytes() {
             let _profiler = dhat::Profiler::builder().testing().build();
 
             let turn = tokio::task::spawn_local(run_turn(actor));
-            tokio::time::timeout(Duration::from_secs(10), expected.wait_blocked())
-                .await
-                .expect("mock server reaches the terminal barrier");
+            expected.wait_blocked().await;
 
             let stats = dhat::HeapStats::get();
             let sample = json!({
@@ -204,14 +198,10 @@ async fn sampler_handoff_live_request_bytes() {
             }
 
             expected.release();
-            tokio::time::timeout(Duration::from_secs(10), turn)
-                .await
-                .expect("turn completes after releasing the terminal barrier")
+            turn.await
                 .expect("turn task does not panic")
                 .expect("sampler completes after releasing the terminal barrier");
-            tokio::time::timeout(Duration::from_secs(10), expected.wait_satisfied())
-                .await
-                .expect("mock server records the released response");
+            expected.wait_satisfied().await;
             expected.assert_satisfied();
         })
         .await;

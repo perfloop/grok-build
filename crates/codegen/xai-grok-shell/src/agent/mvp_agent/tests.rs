@@ -1680,6 +1680,8 @@ async fn ensure_plugin_registry_lazily_populates_snapshot() {
     );
 }
 mod subagent_spawn_context_tests;
+#[path = "tests/request_move_prompt_tests.rs"]
+mod request_move_prompt_tests;
 /// No load in flight and no session → the wait returns immediately
 /// (the caller then surfaces "unknown session id" exactly as before).
 #[tokio::test]
