@@ -2064,3 +2064,6 @@ mod recap_display_only_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/reminder_policy_tests.rs"]
 mod reminder_policy_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/request_move_tests.rs"]
+mod request_move_tests;
