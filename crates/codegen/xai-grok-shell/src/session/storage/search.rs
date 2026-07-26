@@ -39,6 +39,12 @@ const SEARCH_CONTENT_CHAR_LIMIT: usize = 200_000;
 const BOOTSTRAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+// Kept in a new sibling file so the benchmark harness is an exactly removable
+// test-only layer; it needs private access to `flush_ready`'s completion seam.
+#[cfg(test)]
+#[path = "search_maintenance_perf.rs"]
+mod search_maintenance_perf;
+
 /// Configuration for bootstrap resource limits.
 ///
 /// Phase 1-3 use hardcoded defaults via `BootstrapConfig::default()`.

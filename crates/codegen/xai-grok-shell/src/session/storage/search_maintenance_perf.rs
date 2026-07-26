@@ -1,39 +1,29 @@
-//! Focused end-to-end regression and measurement coverage for incremental
-//! session-search maintenance.
+//! Focused regression and measurement coverage for incremental session-search
+//! maintenance.
 //!
-//! The production path is `notify_session_updated` -> debounced
-//! `SearchIndexManager` -> `upsert_session`.  The ignored benchmark below builds
-//! a warm index for six sessions, appends one real ACP user update to each, then
-//! measures the worker drain after the fixed debounce has elapsed.  The fixture
-//! deliberately contains a multi-megabyte history of valid, non-indexable ACP
+//! The production worker's completion boundary is `flush_ready`, which awaits
+//! every `upsert_by_key` it drains.  These unit tests invoke that exact boundary
+//! with already-ready keys, avoiding wall-clock debounce and scheduler timing in
+//! both the differential oracle and the measured sample.  The fixture contains
+//! a multi-megabyte history of valid, non-indexable ACP
 //! `available_commands_update` records: ordinary maintenance must not replay
 //! that history merely to make one appended user message searchable.
-//!
-//! The non-ignored differential test compares the maintained FTS row against a
-//! fresh full bootstrap for append, rewind, incomplete trailing-line, replaced,
-//! truncated, missing, capped-content, title, and delete cases.  It is a
-//! correctness guard for a cursor-backed implementation, not a timing test.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use agent_client_protocol as acp;
 use tempfile::TempDir;
-use xai_grok_shell::session::info::Info;
-use xai_grok_shell::session::storage::search::{
-    SessionSearchRequest, execute_search, notify_session_updated,
-};
-use xai_grok_shell::session::storage::search_fts::{SessionIndexState, SessionSearchIndex};
-use xai_grok_shell::session::storage::{
-    JsonlStorageAdapter, SessionUpdate as StoredSessionUpdate, StorageAdapter,
-};
+use tokio::time::Instant as TokioInstant;
 
-const DISPATCH_SETTLE: Duration = Duration::from_millis(50);
-const DEBOUNCE_SETTLE: Duration = Duration::from_millis(600);
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
-const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+use super::super::jsonl::JsonlStorageAdapter;
+use super::super::search_fts::{SessionIndexState, SessionSearchIndex};
+use super::super::{SessionUpdate as StoredSessionUpdate, StorageAdapter};
+use super::{SessionSearchKey, flush_ready};
+use crate::session::info::Info;
 
 // The benchmark's measured shape is six sessions with about 4 MiB each of
 // historical, non-indexable events and one appended user message per session.
@@ -55,14 +45,6 @@ fn worktree_tempdir(label: &str) -> TempDir {
         .prefix(&prefix)
         .tempdir_in(cwd)
         .expect("create worktree-local fixture directory")
-}
-
-fn set_grok_home(root: &Path) {
-    // Each sealed invocation runs one exact test in a new process, before the
-    // search manager's lazy global can read this process-wide setting.
-    unsafe {
-        std::env::set_var("GROK_HOME", root);
-    }
 }
 
 fn text_chunk(text: String) -> acp::ContentChunk {
@@ -217,53 +199,43 @@ fn title_is_indexed(root: &Path, session_id: &str, title_token: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    loop {
-        if condition() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {label} after {} seconds",
-            WAIT_TIMEOUT.as_secs()
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+async fn assert_after_flush(label: &str, condition: impl FnOnce() -> bool) {
+    assert!(
+        condition(),
+        "flush_ready completed without satisfying {label}"
+    );
 }
 
-async fn bootstrap(root: &Path, sessions: &[FixtureSession]) {
-    let request = SessionSearchRequest {
-        query: "fixture".to_owned(),
-        cwd: None,
-        limit: 10,
-        offset: 0,
-        include_content: false,
-    };
-    execute_search(root, &request)
-        .await
-        .expect("bootstrap session-search index");
+/// Drive the exact production drain boundary with all fixture keys ready now.
+/// `flush_ready` awaits every `upsert_by_key`, so its return is the deterministic
+/// acknowledgement that the index state is durable and can be inspected.
+async fn flush_sessions(root: &Path, storage: &dyn StorageAdapter, sessions: &[FixtureSession]) {
+    let mut pending = HashMap::with_capacity(sessions.len());
+    for session in sessions {
+        pending.insert(
+            SessionSearchKey {
+                session_id: session.info.id.to_string(),
+                cwd: session.info.cwd.clone(),
+            },
+            TokioInstant::now(),
+        );
+    }
+    flush_ready(root, storage, &mut pending).await;
+    assert!(
+        pending.is_empty(),
+        "flush_ready must drain every fixture key"
+    );
+}
 
+async fn index_sessions(root: &Path, storage: &dyn StorageAdapter, sessions: &[FixtureSession]) {
+    flush_sessions(root, storage, sessions).await;
     for session in sessions {
         let session_id = session.info.id.to_string();
-        wait_until(&format!("initial index row for {session_id}"), || {
+        assert_after_flush(&format!("initial index row for {session_id}"), || {
             read_state(root, &session_id).is_some()
         })
         .await;
     }
-}
-
-/// Let the manager receive all notifications, then hold the single-threaded
-/// Tokio runtime past the debounce deadline.  The measured test starts its
-/// timer immediately before yielding the worker, so the fixed 500 ms debounce
-/// cannot dilute the worker-maintenance metric.
-async fn queue_and_pass_debounce(sessions: &[FixtureSession]) {
-    for session in sessions {
-        notify_session_updated(&session.info.id.to_string(), &session.info.cwd);
-    }
-    tokio::time::sleep(DISPATCH_SETTLE).await;
-    std::thread::sleep(DEBOUNCE_SETTLE);
-    tokio::task::yield_now().await;
 }
 
 async fn append_user(adapter: &JsonlStorageAdapter, session: &FixtureSession, text: String) {
@@ -301,22 +273,21 @@ async fn measure_worker_batch(
         tokens.push(token);
     }
 
-    for session in sessions {
-        notify_session_updated(&session.info.id.to_string(), &session.info.cwd);
-    }
-    tokio::time::sleep(DISPATCH_SETTLE).await;
-    std::thread::sleep(DEBOUNCE_SETTLE);
+    // This is the worker's concrete, post-debounce maintenance operation.  The
+    // timer deliberately excludes enqueue/debounce policy and stops before the
+    // postcondition reads below; only `flush_ready`'s awaited upserts count.
     let started = Instant::now();
-    tokio::task::yield_now().await;
+    flush_sessions(root, adapter, sessions).await;
+    let ns_per_upsert = started.elapsed().as_nanos() as f64 / sessions.len() as f64;
 
     for (session, token) in sessions.iter().zip(&tokens) {
         let session_id = session.info.id.to_string();
-        wait_until(&format!("benchmark index update for {session_id}"), || {
+        assert_after_flush(&format!("benchmark index update for {session_id}"), || {
             read_state(root, &session_id).is_some_and(|state| state.content.contains(token))
         })
         .await;
     }
-    started.elapsed().as_nanos() as f64 / sessions.len() as f64
+    ns_per_upsert
 }
 
 fn append_raw(path: &Path, bytes: &[u8]) {
@@ -369,13 +340,12 @@ fn assert_same_state(
 }
 
 /// A differential correctness guard for every recovery boundary a durable
-/// cursor has to preserve.  The reference root is bootstrapped after all final
-/// files are written; it is therefore the old, authoritative full-replay
-/// behavior rather than a duplicated implementation in this test.
+/// cursor has to preserve. The reference root is freshly indexed after all final
+/// files are written, so it is the authoritative full-replay behavior rather
+/// than a duplicated implementation in this test.
 #[tokio::test(flavor = "current_thread")]
 async fn session_search_incremental_matches_full_replay_across_recovery_paths() {
     let root = worktree_tempdir("correctness");
-    set_grok_home(root.path());
     let adapter = JsonlStorageAdapter::with_root(root.path().to_path_buf());
 
     let ordinary = create_session(
@@ -461,10 +431,10 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
         title.clone(),
         deleted.clone(),
     ];
-    bootstrap(root.path(), &all).await;
+    index_sessions(root.path(), &adapter, &all).await;
 
-    // First make a torn trailing line observable.  The temporary title change
-    // lets the test wait for that worker pass without relying on cursor internals.
+    // First make a torn trailing line observable. The temporary title change
+    // establishes completion of that exact flush without inspecting cursors.
     let partial_complete = user_line("partial", "partial-complete-user");
     let split = partial_complete.len() / 2;
     adapter
@@ -472,8 +442,8 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
         .await
         .expect("update partial title");
     append_raw(&partial.updates_path, &partial_complete.as_bytes()[..split]);
-    queue_and_pass_debounce(std::slice::from_ref(&partial)).await;
-    wait_until("partial intermediate title indexed", || {
+    flush_sessions(root.path(), &adapter, std::slice::from_ref(&partial)).await;
+    assert_after_flush("partial intermediate title indexed", || {
         title_is_indexed(
             root.path(),
             &partial.info.id.to_string(),
@@ -529,52 +499,52 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
         .await
         .expect("delete session data");
 
-    queue_and_pass_debounce(&all).await;
-    wait_until("ordinary append", || {
+    flush_sessions(root.path(), &adapter, &all).await;
+    assert_after_flush("ordinary append", || {
         read_state(root.path(), "ordinary")
             .is_some_and(|state| state.content.contains("ordinary-appended-assistant"))
     })
     .await;
-    wait_until("rewind replacement", || {
+    assert_after_flush("rewind replacement", || {
         read_state(root.path(), "rewind")
             .is_some_and(|state| state.content.contains("rewind-replacement-assistant"))
     })
     .await;
-    wait_until("completed trailing line", || {
+    assert_after_flush("completed trailing line", || {
         read_state(root.path(), "partial")
             .is_some_and(|state| state.content.contains("partial-complete-user"))
     })
     .await;
-    wait_until("replaced log", || {
+    assert_after_flush("replaced log", || {
         read_state(root.path(), "replaced")
             .is_some_and(|state| state.content.contains("replacement-new-old-user"))
     })
     .await;
-    wait_until("truncated log", || {
+    assert_after_flush("truncated log", || {
         read_state(root.path(), "truncated")
             .is_some_and(|state| state.content.contains("truncation-new-old-user"))
     })
     .await;
-    wait_until("missing log", || {
+    assert_after_flush("missing log", || {
         read_state(root.path(), "missing").is_some_and(|state| state.content.is_empty())
     })
     .await;
-    wait_until("capped projection tail", || {
+    assert_after_flush("capped projection tail", || {
         read_state(root.path(), "capped")
             .is_some_and(|state| state.content.contains("capped-new-tail-token"))
     })
     .await;
-    wait_until("title-only update", || {
+    assert_after_flush("title-only update", || {
         title_is_indexed(root.path(), "title", "title-after-indexing")
     })
     .await;
-    wait_until("deleted document removed", || {
+    assert_after_flush("deleted document removed", || {
         read_state(root.path(), "deleted").is_none()
     })
     .await;
 
-    // Build a distinct, fresh root holding the final authoritative files.  Its
-    // bootstrap is the reference result for every maintained row above.
+    // Build a distinct, fresh root holding the final authoritative files. Its
+    // direct flush is the reference result for every maintained row above.
     let reference_root = worktree_tempdir("reference");
     let reference_adapter = JsonlStorageAdapter::with_root(reference_root.path().to_path_buf());
     let ordinary_ref = create_session(
@@ -647,7 +617,7 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
         capped_ref.clone(),
         title_ref.clone(),
     ];
-    bootstrap(reference_root.path(), &references).await;
+    index_sessions(reference_root.path(), &reference_adapter, &references).await;
 
     assert_same_state(
         "ordinary append",
@@ -711,9 +681,9 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
     );
 }
 
-/// One per-invocation sample for the proof controller.  The fixture is created
-/// and fully bootstrapped outside the timers.  It measures the same six-session
-/// append batch at a tiny and a roughly 4 MiB/session prior-history point.  The
+/// One per-invocation sample for the proof controller. The fixture is created
+/// and fully indexed outside the timers. It measures the same six-session append
+/// batch at a tiny and a roughly 4 MiB/session prior-history point. The
 /// primary large-history metric demonstrates the user-visible maintenance cost;
 /// the small-history and byte metrics make the algorithmic input-size sweep
 /// explicit without turning that supporting comparison into a second goal.
@@ -721,7 +691,6 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
 #[ignore = "performance sample; run explicitly with --ignored --nocapture"]
 async fn session_search_worker_large_history_batch() {
     let root = worktree_tempdir("benchmark");
-    set_grok_home(root.path());
     let adapter = JsonlStorageAdapter::with_root(root.path().to_path_buf());
 
     let mut small_sessions = Vec::with_capacity(BENCH_SESSION_COUNT);
@@ -749,7 +718,7 @@ async fn session_search_worker_large_history_batch() {
     }
     let mut all_sessions = small_sessions.clone();
     all_sessions.extend(large_sessions.clone());
-    bootstrap(root.path(), &all_sessions).await;
+    index_sessions(root.path(), &adapter, &all_sessions).await;
 
     let small_history_bytes_per_upsert = small_sessions
         .iter()
@@ -775,8 +744,8 @@ async fn session_search_worker_large_history_batch() {
     );
 
     // Run the large point first so the primary sample is not helped by any
-    // immediately preceding small-batch worker activity.  Both batches use the
-    // same real debounce, worker, storage, and FTS state transition.
+    // immediately preceding small-batch activity. Both batches use the same
+    // exact post-debounce worker drain, storage, and FTS state transition.
     let ns_per_upsert = measure_worker_batch(
         &adapter,
         root.path(),
