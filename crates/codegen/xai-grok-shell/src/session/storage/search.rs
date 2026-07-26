@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::Instant;
 
@@ -115,6 +117,10 @@ struct SessionSearchKey {
 
 enum SearchIndexJob {
     Upsert(SessionSearchKey),
+    /// Test-only controlled debounce advance. The acknowledgement is sent only
+    /// after `flush_ready` has awaited every concrete `upsert_by_key` call.
+    #[cfg(test)]
+    FlushAndAcknowledge(oneshot::Sender<()>),
     BootstrapAll,
     /// Dispatched for every `BootstrapOnce` after the first: re-verify the
     /// on-disk completed-bootstrap marker, then either clear the eager
@@ -400,6 +406,17 @@ async fn handle_job(
     match job {
         SearchIndexJob::Upsert(key) => {
             pending.insert(key, Instant::now() + debounce);
+        }
+        #[cfg(test)]
+        SearchIndexJob::FlushAndAcknowledge(acknowledge) => {
+            // This is deliberately a test-only explicit clock advance, not a
+            // production scheduling shortcut. It reaches the same flush path
+            // after the worker has received and coalesced the queued jobs.
+            for deadline in pending.values_mut() {
+                *deadline = Instant::now();
+            }
+            flush_ready(root_dir, storage, pending).await;
+            let _ = acknowledge.send(());
         }
         SearchIndexJob::BootstrapAll => {
             if let Err(e) = reindex_all(root_dir, storage).await {
