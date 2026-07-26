@@ -1,15 +1,15 @@
 //! Focused regression and measurement coverage for incremental session-search
 //! maintenance.
 //!
-//! The production worker's completion boundary is `flush_ready`, which awaits
-//! every `upsert_by_key` it drains.  These unit tests invoke that exact boundary
-//! with already-ready keys, avoiding wall-clock debounce and scheduler timing in
-//! both the differential oracle and the measured sample.  The fixture contains
+//! The unit tests drive the real `run_worker` receiver/coalescing loop. A
+//! cfg(test)-only command makes queued keys ready and acknowledges only after
+//! `flush_ready` has awaited every `upsert_by_key`, avoiding wall-clock debounce
+//! and scheduler timing in both the differential oracle and the measured sample.
+//! The fixture contains
 //! a multi-megabyte history of valid, non-indexable ACP
 //! `available_commands_update` records: ordinary maintenance must not replay
 //! that history merely to make one appended user message searchable.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,28 +17,28 @@ use std::time::Instant;
 
 use agent_client_protocol as acp;
 use tempfile::TempDir;
-use tokio::time::Instant as TokioInstant;
+use tokio::sync::{mpsc, oneshot};
 
+use super::super::SessionUpdate as StoredSessionUpdate;
 use super::super::jsonl::JsonlStorageAdapter;
 use super::super::search_fts::{SessionIndexState, SessionSearchIndex};
-use super::super::{SessionUpdate as StoredSessionUpdate, StorageAdapter};
-use super::{SessionSearchKey, flush_ready};
+use super::{SearchIndexJob, SessionSearchKey, run_worker};
 use crate::session::info::Info;
 
 // The benchmark's measured shape is six sessions with about 4 MiB each of
 // historical, non-indexable events and one appended user message per session.
-pub(super) const BENCH_SESSION_COUNT: usize = 6;
+const BENCH_SESSION_COUNT: usize = 6;
 const BENCH_SMALL_NOISE_LINES: usize = 1;
-pub(super) const BENCH_NOISE_LINES: usize = 512;
-pub(super) const BENCH_NOISE_BYTES: usize = 8 * 1024;
+const BENCH_NOISE_LINES: usize = 512;
+const BENCH_NOISE_BYTES: usize = 8 * 1024;
 
 #[derive(Clone)]
-pub(super) struct FixtureSession {
-    pub(super) info: Info,
+struct FixtureSession {
+    info: Info,
     updates_path: PathBuf,
 }
 
-pub(super) fn worktree_tempdir(label: &str) -> TempDir {
+fn worktree_tempdir(label: &str) -> TempDir {
     let cwd = std::env::current_dir().expect("determine worktree root");
     let prefix = format!(".perfloop-session-search-{label}-");
     tempfile::Builder::new()
@@ -135,7 +135,7 @@ fn short_history(session_id: &str, label: &str) -> Vec<u8> {
     ])
 }
 
-pub(super) fn history_with_noise(
+fn history_with_noise(
     session_id: &str,
     label: &str,
     lines: usize,
@@ -151,7 +151,7 @@ pub(super) fn history_with_noise(
     jsonl_bytes(records)
 }
 
-pub(super) async fn create_session(
+async fn create_session(
     adapter: &JsonlStorageAdapter,
     root: &Path,
     name: &str,
@@ -176,7 +176,7 @@ pub(super) async fn create_session(
     FixtureSession { info, updates_path }
 }
 
-pub(super) fn read_state(root: &Path, session_id: &str) -> Option<SessionIndexState> {
+fn read_state(root: &Path, session_id: &str) -> Option<SessionIndexState> {
     let index =
         SessionSearchIndex::open_or_create(&root.join("sessions/session_search.sqlite")).ok()?;
     index.get_session_index_state(session_id).ok().flatten()
@@ -199,40 +199,45 @@ fn title_is_indexed(root: &Path, session_id: &str, title_token: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) async fn assert_after_flush(label: &str, condition: impl FnOnce() -> bool) {
+async fn assert_after_flush(label: &str, condition: impl FnOnce() -> bool) {
     assert!(
         condition(),
         "flush_ready completed without satisfying {label}"
     );
 }
 
-/// Drive the exact production drain boundary with all fixture keys ready now.
-/// `flush_ready` awaits every `upsert_by_key`, so its return is the deterministic
-/// acknowledgement that the index state is durable and can be inspected.
-async fn flush_sessions(root: &Path, storage: &dyn StorageAdapter, sessions: &[FixtureSession]) {
-    let mut pending = HashMap::with_capacity(sessions.len());
+/// Drive the real worker's receiver and coalescing loop, then request a
+/// cfg(test)-only explicit debounce advance. The acknowledgement returns only
+/// after `flush_ready` has awaited every `upsert_by_key` in this batch.
+async fn flush_sessions(root: &Path, sessions: &[FixtureSession]) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let worker_root = root.to_path_buf();
+    let worker_storage = JsonlStorageAdapter::with_root(worker_root.clone());
+    let worker = tokio::spawn(async move {
+        run_worker(&worker_root, &worker_storage, rx).await;
+    });
+
     for session in sessions {
-        pending.insert(
-            SessionSearchKey {
-                session_id: session.info.id.to_string(),
-                cwd: session.info.cwd.clone(),
-            },
-            TokioInstant::now(),
-        );
+        tx.send(SearchIndexJob::Upsert(SessionSearchKey {
+            session_id: session.info.id.to_string(),
+            cwd: session.info.cwd.clone(),
+        }))
+        .unwrap_or_else(|_| panic!("test worker receiver unexpectedly closed"));
     }
-    flush_ready(root, storage, &mut pending).await;
-    assert!(
-        pending.is_empty(),
-        "flush_ready must drain every fixture key"
-    );
+    let (acknowledge, acknowledged) = oneshot::channel();
+    tx.send(SearchIndexJob::FlushAndAcknowledge(acknowledge))
+        .unwrap_or_else(|_| panic!("test worker receiver unexpectedly closed"));
+    acknowledged
+        .await
+        .expect("test worker must acknowledge the completed flush");
+    drop(tx);
+    worker
+        .await
+        .expect("test worker must stop after sender drop");
 }
 
-pub(super) async fn index_sessions(
-    root: &Path,
-    storage: &dyn StorageAdapter,
-    sessions: &[FixtureSession],
-) {
-    flush_sessions(root, storage, sessions).await;
+async fn index_sessions(root: &Path, sessions: &[FixtureSession]) {
+    flush_sessions(root, sessions).await;
     for session in sessions {
         let session_id = session.info.id.to_string();
         assert_after_flush(&format!("initial index row for {session_id}"), || {
@@ -242,11 +247,7 @@ pub(super) async fn index_sessions(
     }
 }
 
-pub(super) async fn append_user(
-    adapter: &JsonlStorageAdapter,
-    session: &FixtureSession,
-    text: String,
-) {
+async fn append_user(adapter: &JsonlStorageAdapter, session: &FixtureSession, text: String) {
     let update = StoredSessionUpdate::Acp(Box::new(acp::SessionNotification::new(
         session.info.id.clone(),
         acp::SessionUpdate::UserMessageChunk(text_chunk(text)),
@@ -285,7 +286,7 @@ async fn measure_worker_batch(
     // timer deliberately excludes enqueue/debounce policy and stops before the
     // postcondition reads below; only `flush_ready`'s awaited upserts count.
     let started = Instant::now();
-    flush_sessions(root, adapter, sessions).await;
+    flush_sessions(root, sessions).await;
     let ns_per_upsert = started.elapsed().as_nanos() as f64 / sessions.len() as f64;
 
     for (session, token) in sessions.iter().zip(&tokens) {
@@ -439,7 +440,7 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
         title.clone(),
         deleted.clone(),
     ];
-    index_sessions(root.path(), &adapter, &all).await;
+    index_sessions(root.path(), &all).await;
 
     // First make a torn trailing line observable. The temporary title change
     // establishes completion of that exact flush without inspecting cursors.
@@ -450,7 +451,7 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
         .await
         .expect("update partial title");
     append_raw(&partial.updates_path, &partial_complete.as_bytes()[..split]);
-    flush_sessions(root.path(), &adapter, std::slice::from_ref(&partial)).await;
+    flush_sessions(root.path(), std::slice::from_ref(&partial)).await;
     assert_after_flush("partial intermediate title indexed", || {
         title_is_indexed(
             root.path(),
@@ -507,7 +508,7 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
         .await
         .expect("delete session data");
 
-    flush_sessions(root.path(), &adapter, &all).await;
+    flush_sessions(root.path(), &all).await;
     assert_after_flush("ordinary append", || {
         read_state(root.path(), "ordinary")
             .is_some_and(|state| state.content.contains("ordinary-appended-assistant"))
@@ -625,7 +626,7 @@ async fn session_search_incremental_matches_full_replay_across_recovery_paths() 
         capped_ref.clone(),
         title_ref.clone(),
     ];
-    index_sessions(reference_root.path(), &reference_adapter, &references).await;
+    index_sessions(reference_root.path(), &references).await;
 
     assert_same_state(
         "ordinary append",
@@ -726,7 +727,7 @@ async fn session_search_worker_large_history_batch() {
     }
     let mut all_sessions = small_sessions.clone();
     all_sessions.extend(large_sessions.clone());
-    index_sessions(root.path(), &adapter, &all_sessions).await;
+    index_sessions(root.path(), &all_sessions).await;
 
     let small_history_bytes_per_upsert = small_sessions
         .iter()
