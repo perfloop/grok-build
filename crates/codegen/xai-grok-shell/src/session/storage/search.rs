@@ -46,6 +46,9 @@ const BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(test)]
 #[path = "search_maintenance_perf.rs"]
 mod search_maintenance_perf;
+#[cfg(test)]
+#[path = "search_maintenance_worker_guard.rs"]
+mod search_maintenance_worker_guard;
 
 /// Configuration for bootstrap resource limits.
 ///
