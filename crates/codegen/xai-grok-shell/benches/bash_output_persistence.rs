@@ -9,11 +9,12 @@
 //! tool-call sequence at the terminal's 100 ms virtual cadence and waits for
 //! its durable flush barrier.
 //!
-//! The workload is 16 cumulative snapshots of a command that has produced
-//! 64 KiB total output. It models a 1.6 s command producing 4 KiB per 100 ms
-//! tick, below the terminal output-truncation threshold. The audit lines are
-//! consumed by Perfloop's proof adapter and report the actual JSONL bytes and
-//! records added by one complete command, including its terminal update.
+//! The workload is 16 snapshots of a command that has produced 64 KiB total
+//! ASCII output over 1.6 s. It mirrors the default 20,000-character terminal
+//! limit: each progress snapshot is the retained tail after
+//! `ProcessState::maybe_truncate`, while the independent terminal update has
+//! the source's front-and-tail result. The audit lines report the actual JSONL
+//! bytes and records added by one complete command.
 //!
 //! Run: `cargo bench -p xai-grok-shell --bench bash_output_persistence`
 
@@ -30,6 +31,7 @@ use xai_grok_shell::session::persistence::{
     PersistenceHandle, PersistenceMsg, new_with_explicit_dir,
 };
 use xai_grok_shell::session::storage::SessionUpdate;
+use xai_grok_tools::DEFAULT_TOOL_OUTPUT_CHARS;
 use xai_grok_tools::types::output::BashOutput;
 
 const CHUNK_COUNT: usize = 16;
@@ -57,9 +59,42 @@ fn notification(
     ))
 }
 
+/// Mirror `ProcessState::maybe_truncate` for this ASCII fixture. The source
+/// counts characters, so byte and character offsets intentionally coincide here.
+fn truncate_default_tail(output: &mut Vec<u8>, front: &mut Option<Vec<u8>>) -> bool {
+    let rendered = String::from_utf8_lossy(output);
+    let char_count = rendered.chars().count();
+    if char_count <= DEFAULT_TOOL_OUTPUT_CHARS {
+        return false;
+    }
+
+    let half = DEFAULT_TOOL_OUTPUT_CHARS / 2;
+    if front.is_none() {
+        let front_end = rendered
+            .char_indices()
+            .nth(half)
+            .map(|(index, _)| index)
+            .unwrap_or(rendered.len());
+        *front = Some(rendered[..front_end].as_bytes().to_vec());
+    }
+    let tail_start_char = char_count.saturating_sub(half);
+    let tail_start_byte = rendered
+        .char_indices()
+        .nth(tail_start_char)
+        .map(|(index, _)| index)
+        .unwrap_or(rendered.len());
+    let tail = rendered[tail_start_byte..].as_bytes().to_vec();
+    drop(rendered);
+    *output = tail;
+    true
+}
+
 fn cumulative_bash_updates(session_id: &acp::SessionId) -> Vec<SessionUpdate> {
     let tool_call_id = acp::ToolCallId::new("bash-output-bench");
-    let mut output = Vec::with_capacity(CHUNK_COUNT * BYTES_PER_CHUNK);
+    let mut output_tail = Vec::with_capacity(DEFAULT_TOOL_OUTPUT_CHARS);
+    let mut output_front = None;
+    let mut total_bytes = 0;
+    let mut truncated = false;
     let mut updates = Vec::with_capacity(CHUNK_COUNT + 2);
 
     // This mirrors the status-less tool-call update sent before a terminal
@@ -78,21 +113,25 @@ fn cumulative_bash_updates(session_id: &acp::SessionId) -> Vec<SessionUpdate> {
         let prefix = format!("chunk-{chunk_index:02}: ");
         chunk[..prefix.len()].copy_from_slice(prefix.as_bytes());
         chunk[BYTES_PER_CHUNK - 1] = b'\n';
-        output.extend_from_slice(&chunk);
+        total_bytes += chunk.len();
+        output_tail.extend_from_slice(&chunk);
+        truncated |= truncate_default_tail(&mut output_tail, &mut output_front);
 
-        let output_text = String::from_utf8_lossy(&output).into_owned();
+        // `poll_process` sends the post-truncation output_buffer, not the
+        // front-and-tail terminal result.
+        let output_text = String::from_utf8_lossy(&output_tail).into_owned();
         let bash_output = BashOutput {
-            output: output.clone(),
+            output: output_tail.clone(),
             output_for_prompt: BashOutput::make_output_for_prompt(&output_text),
             exit_code: 0,
-            command: "emit-cumulative-output".to_owned(),
-            truncated: false,
+            command: "emit-default-truncated-output".to_owned(),
+            truncated,
             signal: None,
             timed_out: false,
             description: None,
             current_dir: "/bench".to_owned(),
             output_file: String::new(),
-            total_bytes: output.len(),
+            total_bytes,
             output_delta: None,
             was_bare_echo: false,
         };
@@ -113,9 +152,15 @@ fn cumulative_bash_updates(session_id: &acp::SessionId) -> Vec<SessionUpdate> {
     }
 
     // Terminal output is independently emitted by the completed tool-call
-    // path. Keeping it in the workload makes the persisted result replayable
-    // after progress snapshots have been reduced.
-    let final_output = String::from_utf8_lossy(&output).into_owned();
+    // path. `ProcessState::to_result` rejoins the frozen front and tail.
+    let final_output = match output_front {
+        Some(front) => format!(
+            "{}\n\n... (output truncated) ...\n\n{}",
+            String::from_utf8_lossy(&front).trim_end(),
+            String::from_utf8_lossy(&output_tail).trim_start()
+        ),
+        None => String::from_utf8_lossy(&output_tail).into_owned(),
+    };
     updates.push(notification(
         session_id,
         "bench-terminal",
@@ -229,7 +274,7 @@ fn bench_bash_output_persistence(c: &mut Criterion) {
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(50));
     group.measurement_time(Duration::from_millis(200));
-    group.bench_function("16_cumulative_chunks_64KiB", |b| {
+    group.bench_function("16_default_truncated_chunks_64KiB", |b| {
         b.iter_batched(
             || (),
             |_| {
