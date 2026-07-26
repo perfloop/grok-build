@@ -19,9 +19,9 @@ use agent_client_protocol as acp;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 
-use super::super::SessionUpdate as StoredSessionUpdate;
 use super::super::jsonl::JsonlStorageAdapter;
 use super::super::search_fts::{SessionIndexState, SessionSearchIndex};
+use super::super::{SessionUpdate as StoredSessionUpdate, StorageAdapter};
 use super::{SearchIndexJob, SessionSearchKey, run_worker};
 use crate::session::info::Info;
 
