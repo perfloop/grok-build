@@ -6,7 +6,8 @@
 //! production JSONL adapter. This benchmark sends that exact ACP/`BashOutput`
 //! representation through the real persistence actor; fixture creation is
 //! outside Criterion timing, while a measured operation sends one complete
-//! tool-call sequence and waits for its durable flush barrier.
+//! tool-call sequence at the terminal's 100 ms virtual cadence and waits for
+//! its durable flush barrier.
 //!
 //! The workload is 16 cumulative snapshots of a command that has produced
 //! 64 KiB total output. It models a 1.6 s command producing 4 KiB per 100 ms
@@ -33,6 +34,7 @@ use xai_grok_tools::types::output::BashOutput;
 
 const CHUNK_COUNT: usize = 16;
 const BYTES_PER_CHUNK: usize = 4 * 1024;
+const CHUNK_INTERVAL: Duration = Duration::from_millis(100);
 
 struct Fixture {
     _root: TempDir,
@@ -46,7 +48,10 @@ fn notification(
     update: acp::SessionUpdate,
 ) -> SessionUpdate {
     let mut meta = serde_json::Map::new();
-    meta.insert("eventId".to_owned(), serde_json::Value::String(event_id.into()));
+    meta.insert(
+        "eventId".to_owned(),
+        serde_json::Value::String(event_id.into()),
+    );
     SessionUpdate::Acp(Box::new(
         acp::SessionNotification::new(session_id.clone(), update).meta(Some(meta)),
     ))
@@ -100,7 +105,11 @@ fn cumulative_bash_updates(session_id: &acp::SessionId) -> Vec<SessionUpdate> {
                 )]))
                 .raw_output(serde_json::to_value(&bash_output).expect("BashOutput serializes")),
         ));
-        updates.push(notification(session_id, format!("bench-{chunk_index}"), update));
+        updates.push(notification(
+            session_id,
+            format!("bench-{chunk_index}"),
+            update,
+        ));
     }
 
     // Terminal output is independently emitted by the completed tool-call
@@ -130,10 +139,9 @@ fn fixture(runtime: &tokio::runtime::Runtime) -> Fixture {
         id: acp::SessionId::new("bash-output-bench"),
         cwd: "/bench".to_owned(),
     };
-    let sampling_client = xai_grok_shell::sampling::Client::new(
-        xai_grok_sampler::SamplerConfig::default(),
-    )
-    .expect("create persistence sampling client");
+    let sampling_client =
+        xai_grok_shell::sampling::Client::new(xai_grok_sampler::SamplerConfig::default())
+            .expect("create persistence sampling client");
     let persistence = runtime
         .block_on(new_with_explicit_dir(
             &info,
@@ -160,22 +168,31 @@ fn persist_sequence(
     updates: &[SessionUpdate],
 ) -> u64 {
     let before = file_len(&fixture.updates_path);
-    for update in updates {
+    runtime.block_on(async {
+        for (index, update) in updates.iter().enumerate() {
+            fixture
+                .persistence
+                .tx
+                .send(PersistenceMsg::Update(update.clone()))
+                .expect("persistence actor remains available");
+            // Give the actor a deterministic turn for each terminal tick rather
+            // than measuring an all-at-once channel backlog.
+            tokio::task::yield_now().await;
+            if (1..=CHUNK_COUNT).contains(&index) {
+                tokio::time::advance(CHUNK_INTERVAL).await;
+                tokio::task::yield_now().await;
+            }
+        }
+        let (respond_to, acknowledged) = tokio::sync::oneshot::channel();
         fixture
             .persistence
             .tx
-            .send(PersistenceMsg::Update(update.clone()))
-            .expect("persistence actor remains available");
-    }
-    let (respond_to, acknowledged) = tokio::sync::oneshot::channel();
-    fixture
-        .persistence
-        .tx
-        .send(PersistenceMsg::FlushAndAck { respond_to })
-        .expect("queue durable flush barrier");
-    runtime
-        .block_on(acknowledged)
-        .expect("persistence actor acknowledges durable flush");
+            .send(PersistenceMsg::FlushAndAck { respond_to })
+            .expect("queue durable flush barrier");
+        acknowledged
+            .await
+            .expect("persistence actor acknowledges durable flush");
+    });
     file_len(&fixture.updates_path) - before
 }
 
@@ -199,6 +216,7 @@ fn bench_bash_output_persistence(c: &mut Criterion) {
         .enable_all()
         .build()
         .expect("create benchmark runtime");
+    runtime.block_on(async { tokio::time::pause() });
     let audit_updates = cumulative_bash_updates(&acp::SessionId::new("bash-output-bench"));
     let (persisted_bytes, persisted_records) = audit(&runtime, &audit_updates);
     println!("PERFLOOP_METRIC\tpersisted_bytes/op\t{persisted_bytes}");

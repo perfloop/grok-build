@@ -64,6 +64,25 @@ fn neutral_update(info: &Info, text: &str) -> SessionUpdate {
     SessionUpdate::Acp(Box::new(notification(info, text)))
 }
 
+fn tool_update(
+    info: &Info,
+    tool_call_id: &acp::ToolCallId,
+    status: acp::ToolCallStatus,
+    text: &str,
+) -> SessionUpdate {
+    SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+        info.id.clone(),
+        acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            tool_call_id.clone(),
+            acp::ToolCallUpdateFields::new()
+                .status(Some(status))
+                .content(Some(vec![acp::ToolCallContent::from(
+                    acp::ContentBlock::Text(acp::TextContent::new(text)),
+                )])),
+        )),
+    )))
+}
+
 fn break_summary_writes(dir: &std::path::Path) {
     let summary = dir.join("summary.json");
     std::fs::remove_file(&summary).unwrap();
@@ -134,6 +153,109 @@ async fn noop_handle_rejects_durable_append() {
         Err(DurableAppendError::NotCommitted(error))
             if error.kind() == io::ErrorKind::Unsupported
     ));
+}
+
+#[tokio::test]
+async fn repeated_tool_progress_keeps_checkpoint_and_terminal_after_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("tool-progress-flush"),
+        cwd: dir.path().to_string_lossy().into_owned(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage.clone());
+    let tool_call_id = acp::ToolCallId::new("running-bash");
+
+    for output in [
+        "chunk one",
+        "chunk one\nchunk two",
+        "chunk one\nchunk two\nchunk three",
+    ] {
+        actor
+            .handle
+            .tx
+            .send(PersistenceMsg::Update(tool_update(
+                &info,
+                &tool_call_id,
+                acp::ToolCallStatus::InProgress,
+                output,
+            )))
+            .unwrap();
+    }
+    // A reconnect/copy barrier during a running tool must persist one recovery
+    // snapshot before the independently emitted terminal update arrives.
+    let (respond_to, acknowledged) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::FlushAndAck { respond_to })
+        .unwrap();
+    acknowledged.await.unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(tool_update(
+            &info,
+            &tool_call_id,
+            acp::ToolCallStatus::Completed,
+            "terminal output",
+        )))
+        .unwrap();
+    let (respond_to, acknowledged) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::FlushAndAck { respond_to })
+        .unwrap();
+    acknowledged.await.unwrap();
+
+    let updates = storage.load_session(&info).await.unwrap().updates;
+    actor.stop().await;
+    let progress_count = updates
+        .iter()
+        .filter(|update| {
+            matches!(
+                update,
+                SessionUpdate::Acp(notification)
+                    if matches!(
+                        &notification.update,
+                        acp::SessionUpdate::ToolCallUpdate(tool_update)
+                            if matches!(
+                                tool_update.fields.status.as_ref(),
+                                Some(acp::ToolCallStatus::InProgress)
+                            )
+                    )
+            )
+        })
+        .count();
+    assert!(
+        progress_count >= 1,
+        "a flush must retain a recoverable in-progress tool checkpoint"
+    );
+
+    let Some(SessionUpdate::Acp(notification)) = updates.last() else {
+        panic!("terminal update must be the final persisted record");
+    };
+    let acp::SessionUpdate::ToolCallUpdate(terminal) = &notification.update else {
+        panic!("final record must be a ToolCallUpdate");
+    };
+    assert_eq!(terminal.tool_call_id, tool_call_id);
+    assert!(matches!(
+        terminal.fields.status.as_ref(),
+        Some(acp::ToolCallStatus::Completed)
+    ));
+    assert!(
+        serde_json::to_string(terminal)
+            .unwrap()
+            .contains("terminal output"),
+        "the canonical terminal payload must survive the flush"
+    );
 }
 
 #[tokio::test]
