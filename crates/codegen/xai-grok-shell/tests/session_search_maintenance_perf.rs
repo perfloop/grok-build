@@ -26,7 +26,9 @@ use xai_grok_shell::session::storage::search::{
     SessionSearchRequest, execute_search, notify_session_updated,
 };
 use xai_grok_shell::session::storage::search_fts::{SessionIndexState, SessionSearchIndex};
-use xai_grok_shell::session::storage::{JsonlStorageAdapter, StorageAdapter};
+use xai_grok_shell::session::storage::{
+    JsonlStorageAdapter, SessionUpdate as StoredSessionUpdate, StorageAdapter,
+};
 
 const DISPATCH_SETTLE: Duration = Duration::from_millis(50);
 const DEBOUNCE_SETTLE: Duration = Duration::from_millis(600);
@@ -265,21 +267,23 @@ async fn queue_and_pass_debounce(sessions: &[FixtureSession]) {
 }
 
 async fn append_user(adapter: &JsonlStorageAdapter, session: &FixtureSession, text: String) {
+    let update = StoredSessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+        session.info.id.clone(),
+        acp::SessionUpdate::UserMessageChunk(text_chunk(text)),
+    )));
     adapter
-        .append_update(
-            &session.info,
-            &acp::SessionUpdate::UserMessageChunk(text_chunk(text)),
-        )
+        .append_update(&session.info, &update)
         .await
         .expect("append user update");
 }
 
 async fn append_assistant(adapter: &JsonlStorageAdapter, session: &FixtureSession, text: String) {
+    let update = StoredSessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+        session.info.id.clone(),
+        acp::SessionUpdate::AgentMessageChunk(text_chunk(text)),
+    )));
     adapter
-        .append_update(
-            &session.info,
-            &acp::SessionUpdate::AgentMessageChunk(text_chunk(text)),
-        )
+        .append_update(&session.info, &update)
         .await
         .expect("append assistant update");
 }
